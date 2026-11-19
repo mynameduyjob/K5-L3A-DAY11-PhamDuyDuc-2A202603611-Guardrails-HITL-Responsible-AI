@@ -39,18 +39,18 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # PII and secret patterns to check (ordered to avoid overlapping matches)
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "email": r"\b[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "api_key": r"\bsk-[a-zA-Z0-9-]{4,}\b",
+        "db_host": r"\bdb\.vinbank\.internal(?::\d+)?\b",
+        "password": r"(?:password|mật\s*khẩu)\s*(?:[:=]|is|là)\s*[^\s,;]+(?<![.,;])|\badmin123\b",
+        "phone": r"(?:\+84\d{9}|(?<!\d)0\d{9,10})(?!\d)",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -153,7 +153,11 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
         text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
+        if (
+            hasattr(llm_response, "content")
+            and llm_response.content
+            and llm_response.content.parts
+        ):
             for part in llm_response.content.parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
@@ -172,16 +176,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Deterministic content filter (PII & secrets)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            response_text = filter_result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional LLM-as-Judge safety check
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "Response blocked by safety policy. "
+                                "Please contact official VinBank support (hotline 1900 545 467)."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
